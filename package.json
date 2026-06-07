@@ -1,0 +1,54 @@
+{
+  "name": "@hatkom/nestjs-graphql-plugin",
+  "version": "1.0.0",
+  "description": "NestJS GraphQL TypeScript compiler plugin and enum codegen for Prisma-based projects.",
+  "author": "Vladyslav Zavalykhatko",
+  "license": "MIT",
+  "main": "./dist/plugin.js",
+  "types": "./dist/plugin.d.ts",
+  "bin": {
+    "nestjs-generate-enums": "./dist/generate-enums.js"
+  },
+  "exports": {
+    ".": "./dist/plugin.js",
+    "./generate-enums": "./dist/generate-enums.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf ./dist && tsc",
+    "bump": "bunx npm-check-updates -u --deep -p bun && bun i && bun update"
+  },
+  "keywords": [
+    "nestjs",
+    "graphql",
+    "prisma",
+    "plugin",
+    "typescript",
+    "codegen",
+    "flavoured-ids"
+  ],
+  "dependencies": {
+    "ts-morph": "^28.0.0"
+  },
+  "peerDependencies": {
+    "typescript": ">=6.0.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.16",
+    "@types/node": "^25.9.2",
+    "typescript": "^6.0.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/Hatkom-io/nestjs-graphql-plugin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hatkom-io/nestjs-graphql-plugin.git"
+  },
+  "trustedDependencies": [
+    "@biomejs/biome"
+  ]
+}
