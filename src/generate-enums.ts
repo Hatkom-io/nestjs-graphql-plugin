@@ -189,6 +189,74 @@ for (const file of project.getSourceFiles()) {
   }
 }
 
+// Also scan class properties in *.args.ts / *.input.ts files.
+// The NestJS plugin injects @Field(() => EnumType) for these at compile time,
+// but this scanner runs on source files where those decorators don't exist yet.
+const ARGS_INPUT_RE = /\.(args|input)\.ts$/
+
+function extractBaseTypeIdentifier(typeNode: Node): Node | undefined {
+  let node = typeNode
+
+  if (Node.isUnionTypeNode(node)) {
+    const nonNullable = node.getTypeNodes().filter((t) => {
+      const k = t.getKind()
+      return (
+        k !== SyntaxKind.UndefinedKeyword &&
+        !(
+          Node.isLiteralTypeNode(t) &&
+          t.getLiteral().getKind() === SyntaxKind.NullKeyword
+        )
+      )
+    })
+    if (nonNullable.length !== 1) return undefined
+    node = nonNullable[0]
+  }
+
+  if (Node.isArrayTypeNode(node)) {
+    node = node.getElementTypeNode()
+  }
+
+  if (!Node.isTypeReference(node)) return undefined
+  const typeName = node.getTypeName()
+  if (!Node.isIdentifier(typeName)) return undefined
+  return typeName
+}
+
+for (const file of project.getSourceFiles()) {
+  const filePath = file.getFilePath()
+  if (!filePath.startsWith(srcRoot) || filePath === outputFile) continue
+  if (!ARGS_INPUT_RE.test(filePath)) continue
+
+  for (const cls of file.getClasses()) {
+    for (const prop of cls.getProperties()) {
+      if (prop.getDecorators().some((d) => d.getName() === 'Field')) continue
+
+      const typeNode = prop.getTypeNode()
+      if (!typeNode) continue
+
+      const identifier = extractBaseTypeIdentifier(typeNode)
+      if (!identifier || identifier.getText() === 'ID') continue
+
+      const resolved = resolveEnum(identifier)
+      if (!resolved) continue
+
+      const sourceModule = resolveSourceModule(
+        identifier.getText(),
+        resolved.sourceFilePath,
+        file,
+      )
+      if (!sourceModule) continue
+
+      const key = `${sourceModule}::${resolved.name}`
+      registrations.set(key, {
+        sourceModule,
+        identifier: resolved.name,
+        graphqlName: nameOverrides.get(key) ?? resolved.name,
+      })
+    }
+  }
+}
+
 const sorted = [...registrations.values()].sort(
   (a, b) =>
     a.sourceModule.localeCompare(b.sourceModule) ||

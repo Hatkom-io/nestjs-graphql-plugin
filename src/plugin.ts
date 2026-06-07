@@ -6,7 +6,7 @@ import * as ts from 'typescript'
  *   { "name": "@hatkom/nestjs-graphql-plugin", "options": { ... } }
  *
  * All fields are optional — the defaults cover a standard
- * prisma-generator-flavoured-ids setup.
+ * prisma-generator-flavoured-ids + NestJS project layout.
  */
 export type PluginOptions = {
   /**
@@ -25,6 +25,18 @@ export type PluginOptions = {
    * Defaults to `{ float: "Float", int: "Int" }`.
    */
   scalars?: Record<string, string>
+  /**
+   * Auto-inject `@ArgsType()` on classes whose name ends in `Args` inside
+   * `*.args.ts` files. Classes already carrying any GraphQL class decorator
+   * are left untouched. Defaults to `true`.
+   */
+  autoArgsType?: boolean
+  /**
+   * Auto-inject `@InputType()` on classes whose name ends in `Input` inside
+   * `*.input.ts` files. Classes already carrying any GraphQL class decorator
+   * are left untouched. Defaults to `true`.
+   */
+  autoInputType?: boolean
 }
 
 const GRAPHQL_CLASS_DECORATORS = new Set([
@@ -35,6 +47,33 @@ const GRAPHQL_CLASS_DECORATORS = new Set([
 ])
 
 const SKIP_PROPERTY_DECORATORS = new Set(['Field', 'HideField'])
+
+function isConstObjectEnumDecl(decl: ts.VariableDeclaration): boolean {
+  const initializer = decl.initializer
+  if (!initializer) return false
+  const literal = ts.isAsExpression(initializer)
+    ? initializer.expression
+    : initializer
+  if (!ts.isObjectLiteralExpression(literal)) return false
+  return (
+    literal.properties.length > 0 &&
+    literal.properties.every(
+      (p) =>
+        ts.isPropertyAssignment(p) &&
+        p.initializer !== undefined &&
+        ts.isStringLiteral(p.initializer),
+    )
+  )
+}
+
+function isEnumSymbol(symbol: ts.Symbol): boolean {
+  for (const decl of symbol.declarations ?? []) {
+    if (ts.isEnumDeclaration(decl)) return true
+    if (ts.isVariableDeclaration(decl) && isConstObjectEnumDecl(decl))
+      return true
+  }
+  return false
+}
 
 const FLAVORED_ID_PATTERN = /^[A-Z][A-Za-z0-9_]*Id$/
 
@@ -71,6 +110,32 @@ function hasSkipDecorator(node: ts.PropertyDeclaration): boolean {
     const name = getDecoratorName(d)
     return name !== undefined && SKIP_PROPERTY_DECORATORS.has(name)
   })
+}
+
+/**
+ * Returns the class-level decorator name to inject based on filename and class
+ * name conventions, or `undefined` if the class should not be auto-decorated.
+ * Already-decorated classes are always skipped.
+ *
+ * Both `.args.ts` and `.input.ts` files support both suffixes — `*Args` always
+ * maps to `@ArgsType()` and `*Input` always maps to `@InputType()`, regardless
+ * of which extension the file uses.
+ */
+function getAutoClassDecorator(
+  node: ts.ClassDeclaration,
+  fileName: string,
+  autoArgsType: boolean,
+  autoInputType: boolean,
+): 'ArgsType' | 'InputType' | undefined {
+  if (isGraphQLClass(node)) return undefined
+  const name = node.name?.text
+  if (!name) return undefined
+  const isArgsOrInputFile =
+    fileName.endsWith('.args.ts') || fileName.endsWith('.input.ts')
+  if (!isArgsOrInputFile) return undefined
+  if (autoArgsType && name.endsWith('Args')) return 'ArgsType'
+  if (autoInputType && name.endsWith('Input')) return 'InputType'
+  return undefined
 }
 
 function collectFlavoredIdNames(
@@ -125,6 +190,23 @@ type TypeAnalysis = {
   isArray: boolean
   isNullable: boolean
   gqlScalar: string
+  isEnum?: boolean
+}
+
+function resolveEnumName(
+  inner: ts.TypeReferenceNode,
+  checker: ts.TypeChecker,
+): string | undefined {
+  if (!ts.isIdentifier(inner.typeName)) return undefined
+  const name = inner.typeName.text
+  const symbol = checker.getSymbolAtLocation(inner.typeName)
+  if (!symbol) return undefined
+  if (isEnumSymbol(symbol)) return name
+  if (symbol.flags & ts.SymbolFlags.Alias) {
+    const aliased = checker.getAliasedSymbol(symbol)
+    if (isEnumSymbol(aliased)) return name
+  }
+  return undefined
 }
 
 function analyzeType(
@@ -132,6 +214,7 @@ function analyzeType(
   isOptional: boolean,
   flavoredIdNames: Set<string>,
   sharedScalars: Map<string, string>,
+  checker?: ts.TypeChecker,
 ): TypeAnalysis | undefined {
   if (!typeNode) return undefined
 
@@ -187,6 +270,12 @@ function analyzeType(
     return { isArray, isNullable, gqlScalar }
   }
 
+  if (checker) {
+    const enumName = resolveEnumName(inner, checker)
+    if (enumName)
+      return { isArray, isNullable, gqlScalar: enumName, isEnum: true }
+  }
+
   return undefined
 }
 
@@ -198,14 +287,16 @@ function createFieldDecorator(
     namespaceIdent,
     ts.factory.createIdentifier('Field'),
   )
-  const scalarAccess = ts.factory.createPropertyAccessExpression(
-    namespaceIdent,
-    ts.factory.createIdentifier(analysis.gqlScalar),
-  )
+  const typeExpr = analysis.isEnum
+    ? ts.factory.createIdentifier(analysis.gqlScalar)
+    : ts.factory.createPropertyAccessExpression(
+        namespaceIdent,
+        ts.factory.createIdentifier(analysis.gqlScalar),
+      )
 
   const typeRef = analysis.isArray
-    ? ts.factory.createArrayLiteralExpression([scalarAccess], false)
-    : scalarAccess
+    ? ts.factory.createArrayLiteralExpression([typeExpr], false)
+    : typeExpr
 
   const arrow = ts.factory.createArrowFunction(
     undefined,
@@ -236,6 +327,22 @@ function createFieldDecorator(
   )
 }
 
+function createClassDecorator(
+  decoratorName: string,
+  namespaceIdent: ts.Identifier,
+): ts.Decorator {
+  return ts.factory.createDecorator(
+    ts.factory.createCallExpression(
+      ts.factory.createPropertyAccessExpression(
+        namespaceIdent,
+        ts.factory.createIdentifier(decoratorName),
+      ),
+      undefined,
+      [],
+    ),
+  )
+}
+
 function transformClass(
   node: ts.ClassDeclaration,
   flavoredIdNames: Set<string>,
@@ -243,8 +350,10 @@ function transformClass(
   namespaceIdent: ts.Identifier,
   context: ts.TransformationContext,
   state: { modified: boolean },
+  autoDecorator: 'ArgsType' | 'InputType' | undefined,
+  checker?: ts.TypeChecker,
 ): ts.ClassDeclaration {
-  const visitor = (member: ts.Node): ts.Node => {
+  const propertyVisitor = (member: ts.Node): ts.Node => {
     if (!ts.isPropertyDeclaration(member)) return member
     if (hasSkipDecorator(member)) return member
 
@@ -253,6 +362,7 @@ function transformClass(
       member.questionToken !== undefined,
       flavoredIdNames,
       sharedScalars,
+      checker,
     )
     if (!analysis) return member
 
@@ -273,7 +383,26 @@ function transformClass(
     )
   }
 
-  return ts.visitEachChild(node, visitor, context) as ts.ClassDeclaration
+  let result = ts.visitEachChild(
+    node,
+    propertyVisitor,
+    context,
+  ) as ts.ClassDeclaration
+
+  if (autoDecorator) {
+    state.modified = true
+    const classDecorator = createClassDecorator(autoDecorator, namespaceIdent)
+    result = ts.factory.updateClassDeclaration(
+      result,
+      [classDecorator, ...(result.modifiers ?? [])],
+      result.name,
+      result.typeParameters,
+      result.heritageClauses,
+      result.members,
+    )
+  }
+
+  return result
 }
 
 function buildNamespaceRequireStatement(
@@ -301,7 +430,7 @@ function buildNamespaceRequireStatement(
 
 function makeTransformer(
   options: PluginOptions | undefined,
-  _program: ts.Program | undefined,
+  program: ts.Program | undefined,
 ): ts.TransformerFactory<ts.SourceFile> {
   const idModulePattern = new RegExp(
     options?.idModulePattern ?? DEFAULT_ID_MODULE_PATTERN.source,
@@ -310,32 +439,55 @@ function makeTransformer(
   const scalars = options?.scalars
     ? new Map(Object.entries(options.scalars))
     : DEFAULT_SCALARS
+  const autoArgsType = options?.autoArgsType ?? true
+  const autoInputType = options?.autoInputType ?? true
+  const checker = program?.getTypeChecker()
 
   return (context) => (sourceFile) => {
     if (sourceFile.isDeclarationFile) return sourceFile
 
+    const { fileName } = sourceFile
     const flavoredIdNames = collectFlavoredIdNames(sourceFile, idModulePattern)
     const sharedScalars = collectSharedScalars(
       sourceFile,
       scalarModule,
       scalars,
     )
-    if (flavoredIdNames.size === 0 && sharedScalars.size === 0)
+
+    const mightAutoDecorate =
+      (autoArgsType || autoInputType) &&
+      (fileName.endsWith('.args.ts') || fileName.endsWith('.input.ts'))
+
+    if (
+      flavoredIdNames.size === 0 &&
+      sharedScalars.size === 0 &&
+      !mightAutoDecorate
+    )
       return sourceFile
 
     const namespaceIdent = ts.factory.createUniqueName('__pid_graphql')
     const state = { modified: false }
 
     const visit = (node: ts.Node): ts.Node => {
-      if (ts.isClassDeclaration(node) && isGraphQLClass(node)) {
-        return transformClass(
+      if (ts.isClassDeclaration(node)) {
+        const autoDecorator = getAutoClassDecorator(
           node,
-          flavoredIdNames,
-          sharedScalars,
-          namespaceIdent,
-          context,
-          state,
+          fileName,
+          autoArgsType,
+          autoInputType,
         )
+        if (isGraphQLClass(node) || autoDecorator !== undefined) {
+          return transformClass(
+            node,
+            flavoredIdNames,
+            sharedScalars,
+            namespaceIdent,
+            context,
+            state,
+            autoDecorator,
+            checker,
+          )
+        }
       }
       return ts.visitEachChild(node, visit, context)
     }

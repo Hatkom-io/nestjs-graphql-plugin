@@ -2,8 +2,8 @@
 
 Two complementary tools that eliminate the GraphQL schema boilerplate you would otherwise write by hand in a NestJS project:
 
-1. **TypeScript compiler plugin** — auto-injects `@Field(() => ID)` decorators on class properties typed as [flavoured Prisma IDs](https://github.com/Hatkom-io/prisma-generator-flavoured-ids), and optionally maps scalar aliases from a shared module to their GraphQL scalar types.
-2. **`nestjs-generate-enums` CLI** — scans your source tree for enums referenced in `@Field`, `@Query`, `@Mutation`, `@Subscription`, and `@ResolveField` decorators, then generates a single file of `registerEnumType(...)` calls you import once from your app module.
+1. **TypeScript compiler plugin** — auto-injects `@Field()` decorators on class properties typed as [flavoured Prisma IDs](https://github.com/Hatkom-io/prisma-generator-flavoured-ids), enums, or configured scalar aliases. Also auto-injects `@ArgsType()` / `@InputType()` on undecorated classes in `*.args.ts` / `*.input.ts` files.
+2. **`nestjs-generate-enums` CLI** — scans your source tree for enums referenced in GraphQL decorators **and** in class properties inside `*.args.ts` / `*.input.ts` files, then generates a single file of `registerEnumType(...)` calls you import once from your app module.
 
 ## Installation
 
@@ -21,9 +21,13 @@ TypeScript must be installed separately (peer dependency, `>=5.0.0`).
 
 ### What it does
 
-NestJS's built-in GraphQL plugin auto-adds `@Field()` for primitive types but skips branded/intersection types — which is exactly what [prisma-generator-flavoured-ids](https://github.com/Hatkom-io/prisma-generator-flavoured-ids) produces. This plugin closes that gap by inspecting import statements at compile time and injecting `@Field(() => ID)` wherever a flavoured ID type is used as a property.
+NestJS's built-in GraphQL plugin auto-adds `@Field()` for primitive types but skips branded IDs, enums, and custom scalars. This plugin fills three gaps:
 
-It also optionally maps scalar type aliases from a shared module (e.g. `float` → `@Field(() => Float)`) using the same mechanism.
+- **Flavoured IDs** — injects `@Field(() => ID)` for properties typed as [prisma-generator-flavoured-ids](https://github.com/Hatkom-io/prisma-generator-flavoured-ids) (names matching `^[A-Z][A-Za-z0-9_]*Id$` imported from the configured module).
+- **Enums** — uses the TypeScript type checker to detect both `enum Foo {}` and `const Foo = { ... } as const` enum patterns and injects `@Field(() => Foo)` automatically.
+- **Scalar aliases** — optionally maps named exports from a shared module to their GraphQL scalar types (e.g. `float` → `@Field(() => Float)`).
+
+It also auto-injects `@ArgsType()` on classes ending in `Args` inside `*.args.ts` files, and `@InputType()` on classes ending in `Input` inside `*.input.ts` files, so no class-level decorators are needed.
 
 ### Configuration
 
@@ -70,34 +74,35 @@ With options:
 | `idModulePattern` | `string` (regex) | `@generated/prisma/` | Regex matched against the import path. Matching imports whose exported names satisfy `^[A-Z][A-Za-z0-9_]*Id$` are treated as ID types. |
 | `scalarModule` | `string` | *(disabled)* | Module from which scalar aliases are imported. When omitted, scalar handling is skipped. |
 | `scalars` | `Record<string, string>` | `{ float: "Float", int: "Int" }` | Map of exported identifier → GraphQL scalar name for imports from `scalarModule`. |
+| `autoArgsType` | `boolean` | `true` | Auto-inject `@ArgsType()` on classes ending in `Args` inside `*.args.ts` files. |
+| `autoInputType` | `boolean` | `true` | Auto-inject `@InputType()` on classes ending in `Input` inside `*.input.ts` files. |
 
 ### Behaviour
 
-- Only fires inside classes decorated with `@ObjectType`, `@InputType`, `@ArgsType`, or `@InterfaceType`.
-- Properties already carrying `@Field` or `@HideField` are left untouched.
+- For `*.args.ts` and `*.input.ts` files, auto-injects `@ArgsType()` / `@InputType()` on matching class names. Classes already carrying any GraphQL class decorator are left untouched.
+- Inside eligible classes, injects `@Field()` for flavoured ID types, enums, and configured scalar aliases. Properties already carrying `@Field` or `@HideField` are skipped.
 - Handles `T[]`, `Array<T>`, `T | null`, and optional (`?:`) for array-ness and nullability.
 
 ### Before / after
 
 ```typescript
-// Before — explicit @Field required on every ID property
-@ObjectType()
-export class InvoiceModel {
-  @Field(() => ID)
-  id: InvoiceId
-
+// Before — explicit decorators required on every ID, enum, and class
+@ArgsType()
+export class FindInvoicesArgs {
   @Field(() => ID)
   fundId: FundId
 
-  amount: number
+  @Field(() => InvoiceStatus)
+  status: InvoiceStatus
+
+  page?: number
 }
 
-// After — @Field(() => ID) injected automatically at compile time
-@ObjectType()
-export class InvoiceModel {
-  id: InvoiceId
+// After — everything injected automatically at compile time
+export class FindInvoicesArgs {
   fundId: FundId
-  amount: number
+  status: InvoiceStatus
+  page?: number
 }
 ```
 
@@ -107,7 +112,11 @@ export class InvoiceModel {
 
 ### What it does
 
-NestJS requires every enum used in a GraphQL schema to be registered via `registerEnumType(MyEnum, { name: 'MyEnum' })`. This command scans your source tree, finds every enum referenced in GraphQL decorators, and emits a single generated file that registers them all.
+NestJS requires every enum used in a GraphQL schema to be registered via `registerEnumType(MyEnum, { name: 'MyEnum' })`. This command scans your source tree and emits a single generated file that registers them all.
+
+It detects enums from two sources:
+- **GraphQL decorators** — any enum referenced via `@Field(() => MyEnum)`, `@Query`, `@Mutation`, `@Subscription`, or `@ResolveField`.
+- **Args/Input class properties** — enum-typed properties in `*.args.ts` and `*.input.ts` files, even without an explicit `@Field()` decorator (since those are injected at compile time by the plugin).
 
 ### Usage
 
