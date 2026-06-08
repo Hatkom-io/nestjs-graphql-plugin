@@ -192,7 +192,7 @@ for (const file of project.getSourceFiles()) {
 // Also scan class properties in *.args.ts / *.input.ts files.
 // The NestJS plugin injects @Field(() => EnumType) for these at compile time,
 // but this scanner runs on source files where those decorators don't exist yet.
-const ARGS_INPUT_RE = /\.(args|input)\.ts$/
+const ARGS_INPUT_MODEL_RE = /\.(args|input|model)\.ts$/
 
 function extractBaseTypeIdentifier(typeNode: Node): Node | undefined {
   let node = typeNode
@@ -225,7 +225,7 @@ function extractBaseTypeIdentifier(typeNode: Node): Node | undefined {
 for (const file of project.getSourceFiles()) {
   const filePath = file.getFilePath()
   if (!filePath.startsWith(srcRoot) || filePath === outputFile) continue
-  if (!ARGS_INPUT_RE.test(filePath)) continue
+  if (!ARGS_INPUT_MODEL_RE.test(filePath)) continue
 
   for (const cls of file.getClasses()) {
     for (const prop of cls.getProperties()) {
