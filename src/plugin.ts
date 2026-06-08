@@ -152,6 +152,67 @@ function getAutoClassDecorator(
 }
 
 /**
+ * Returns the set of locally-defined class names that appear as a property type
+ * in any class in the source file. Used to detect args classes that are also
+ * used as nested input types and therefore need @InputType() in addition to
+ * @ArgsType() so NestJS can find them in typeDefinitionsStorage.
+ */
+function collectLocalClassNamesUsedAsPropertyTypes(
+  sourceFile: ts.SourceFile,
+): Set<string> {
+  const localClassNames = new Set<string>()
+  for (const stmt of sourceFile.statements) {
+    if (ts.isClassDeclaration(stmt) && stmt.name) {
+      localClassNames.add(stmt.name.text)
+    }
+  }
+
+  const usedAsType = new Set<string>()
+
+  function extractBaseTypeName(typeNode: ts.TypeNode): string | undefined {
+    let inner: ts.TypeNode = typeNode
+    if (ts.isUnionTypeNode(inner)) {
+      const nonNull = inner.types.filter(
+        (t) =>
+          !(
+            ts.isLiteralTypeNode(t) &&
+            t.literal.kind === ts.SyntaxKind.NullKeyword
+          ) && t.kind !== ts.SyntaxKind.UndefinedKeyword,
+      )
+      if (nonNull.length !== 1) return undefined
+      inner = nonNull[0]
+    }
+    if (ts.isArrayTypeNode(inner)) {
+      inner = inner.elementType
+    } else if (
+      ts.isTypeReferenceNode(inner) &&
+      ts.isIdentifier(inner.typeName) &&
+      inner.typeName.text === 'Array' &&
+      inner.typeArguments?.length === 1
+    ) {
+      inner = inner.typeArguments[0]
+    }
+    if (ts.isTypeReferenceNode(inner) && ts.isIdentifier(inner.typeName)) {
+      return inner.typeName.text
+    }
+    return undefined
+  }
+
+  for (const stmt of sourceFile.statements) {
+    if (!ts.isClassDeclaration(stmt)) continue
+    for (const member of stmt.members) {
+      if (!ts.isPropertyDeclaration(member) || !member.type) continue
+      const typeName = extractBaseTypeName(member.type)
+      if (typeName && localClassNames.has(typeName)) {
+        usedAsType.add(typeName)
+      }
+    }
+  }
+
+  return usedAsType
+}
+
+/**
  * Returns the set of class names that are explicitly exported from the given
  * source file. Used to determine whether a locally-defined class can be
  * referenced via `exports.ClassName` in _GRAPHQL_METADATA_FACTORY.
@@ -452,6 +513,9 @@ function analyzeType(
         gqlScalar: enumName,
         isEnum: true,
         importedNsIdent,
+        // Locally-defined enum: importedNsIdent is undefined, use bare identifier.
+        // Imported enums go through importedNsIdent (require() namespace).
+        useGlobalIdent: importedNsIdent === undefined,
       }
     }
 
@@ -683,6 +747,7 @@ function transformClass(
   checker?: ts.TypeChecker,
   importedTypeEntries?: Map<string, ImportedTypeEntry>,
   exportedClassNames?: Set<string>,
+  localClassNamesUsedAsPropertyTypes?: Set<string>,
 ): ts.ClassDeclaration {
   const metadataFactoryEntries: MetadataFactoryEntry[] = []
 
@@ -781,9 +846,18 @@ function transformClass(
       namespaceIdent,
       typeName,
     )
+    const extraDecorators: ts.Decorator[] = []
+    // An @ArgsType class used as a nested property type in the same file must also
+    // be registered as @InputType() so NestJS can find it in typeDefinitionsStorage.
+    if (
+      autoDecorator === 'ArgsType' &&
+      localClassNamesUsedAsPropertyTypes?.has(className)
+    ) {
+      extraDecorators.push(createClassDecorator('InputType', namespaceIdent))
+    }
     result = ts.factory.updateClassDeclaration(
       result,
-      [classDecorator, ...(result.modifiers ?? [])],
+      [...extraDecorators, classDecorator, ...(result.modifiers ?? [])],
       result.name,
       result.typeParameters,
       result.heritageClauses,
@@ -861,6 +935,8 @@ function makeTransformer(
       ? collectImportedTypeEntries(sourceFile, checker)
       : new Map<string, ImportedTypeEntry>()
     const exportedClassNames = collectExportedClassNames(sourceFile)
+    const localClassNamesUsedAsPropertyTypes =
+      collectLocalClassNamesUsedAsPropertyTypes(sourceFile)
 
     const namespaceIdent = ts.factory.createUniqueName('__pid_graphql')
     const state: TransformState = {
@@ -890,6 +966,7 @@ function makeTransformer(
             checker,
             importedTypeEntries,
             exportedClassNames,
+            localClassNamesUsedAsPropertyTypes,
           )
         }
       }
