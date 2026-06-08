@@ -451,7 +451,22 @@ function analyzeType(
       }
       nonNullable.push(t)
     }
-    if (nonNullable.length !== 1) return undefined
+    if (nonNullable.length !== 1) {
+      // Special case: union of multiple flavoured IDs (e.g. InvestorId | ShareClassId).
+      // All flavoured IDs map to the GraphQL ID scalar, so the union collapses to ID.
+      if (
+        nonNullable.length > 1 &&
+        nonNullable.every(
+          (t) =>
+            ts.isTypeReferenceNode(t) &&
+            ts.isIdentifier(t.typeName) &&
+            flavoredIdNames.has(t.typeName.text),
+        )
+      ) {
+        return { isArray: false, isNullable, gqlScalar: 'ID' }
+      }
+      return undefined
+    }
     inner = nonNullable[0]
   }
 
