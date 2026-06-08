@@ -27,7 +27,10 @@ NestJS's built-in GraphQL plugin auto-adds `@Field()` for primitive types but sk
 - **Enums** — uses the TypeScript type checker to detect both `enum Foo {}` and `const Foo = { ... } as const` enum patterns and injects `@Field(() => Foo)` automatically.
 - **Scalar aliases** — optionally maps named exports from a shared module to their GraphQL scalar types (e.g. `float` → `@Field(() => Float)`).
 
-It also auto-injects `@ArgsType()` on classes ending in `Args` inside `*.args.ts` files, and `@InputType()` on classes ending in `Input` inside `*.input.ts` files, so no class-level decorators are needed.
+It also auto-injects class-level decorators so none need to be written by hand:
+- `@ArgsType()` on classes ending in `Args` inside `*.args.ts` files
+- `@InputType()` on classes ending in `Input` inside `*.input.ts` files
+- `@ObjectType()` on classes ending in `Model` inside `*.model.ts` files
 
 ### Configuration
 
@@ -76,10 +79,11 @@ With options:
 | `scalars` | `Record<string, string>` | `{ float: "Float", int: "Int" }` | Map of exported identifier → GraphQL scalar name for imports from `scalarModule`. |
 | `autoArgsType` | `boolean` | `true` | Auto-inject `@ArgsType()` on classes ending in `Args` inside `*.args.ts` files. |
 | `autoInputType` | `boolean` | `true` | Auto-inject `@InputType()` on classes ending in `Input` inside `*.input.ts` files. |
+| `autoObjectType` | `boolean` | `true` | Auto-inject `@ObjectType()` on classes ending in `Model` inside `*.model.ts` files. |
 
 ### Behaviour
 
-- For `*.args.ts` and `*.input.ts` files, auto-injects `@ArgsType()` / `@InputType()` on matching class names. Classes already carrying any GraphQL class decorator are left untouched.
+- For `*.args.ts` and `*.input.ts` files, auto-injects `@ArgsType()` / `@InputType()` on matching class names. For `*.model.ts` files, auto-injects `@ObjectType()` on classes ending in `Model`. Classes already carrying any GraphQL class decorator are left untouched.
 - Inside eligible classes, injects `@Field()` for flavoured ID types, enums, and configured scalar aliases. Properties already carrying `@Field` or `@HideField` are skipped.
 - Handles `T[]`, `Array<T>`, `T | null`, and optional (`?:`) for array-ness and nullability.
 

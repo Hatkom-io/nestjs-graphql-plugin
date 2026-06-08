@@ -1,6 +1,6 @@
 {
   "name": "@hatkom/nestjs-graphql-plugin",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "NestJS GraphQL TypeScript compiler plugin and enum codegen for Prisma-based projects.",
   "author": "Vladyslav Zavalykhatko",
   "license": "MIT",

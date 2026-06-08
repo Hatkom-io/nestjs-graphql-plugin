@@ -37,6 +37,12 @@ export type PluginOptions = {
    * are left untouched. Defaults to `true`.
    */
   autoInputType?: boolean
+  /**
+   * Auto-inject `@ObjectType()` on classes whose name ends in `Model` inside
+   * `*.model.ts` files. Classes already carrying any GraphQL class decorator
+   * are left untouched. Defaults to `true`.
+   */
+  autoObjectType?: boolean
 }
 
 const GRAPHQL_CLASS_DECORATORS = new Set([
@@ -126,15 +132,21 @@ function getAutoClassDecorator(
   fileName: string,
   autoArgsType: boolean,
   autoInputType: boolean,
-): 'ArgsType' | 'InputType' | undefined {
+  autoObjectType: boolean,
+): 'ArgsType' | 'InputType' | 'ObjectType' | undefined {
   if (isGraphQLClass(node)) return undefined
   const name = node.name?.text
   if (!name) return undefined
-  const isArgsOrInputFile =
-    fileName.endsWith('.args.ts') || fileName.endsWith('.input.ts')
-  if (!isArgsOrInputFile) return undefined
-  if (autoArgsType && name.endsWith('Args')) return 'ArgsType'
-  if (autoInputType && name.endsWith('Input')) return 'InputType'
+  if (fileName.endsWith('.args.ts') || fileName.endsWith('.input.ts')) {
+    if (autoArgsType && name.endsWith('Args')) return 'ArgsType'
+    if (autoInputType && name.endsWith('Input')) return 'InputType'
+  }
+  if (
+    autoObjectType &&
+    fileName.endsWith('.model.ts') &&
+    name.endsWith('Model')
+  )
+    return 'ObjectType'
   return undefined
 }
 
@@ -330,7 +342,11 @@ function createFieldDecorator(
 function createClassDecorator(
   decoratorName: string,
   namespaceIdent: ts.Identifier,
+  typeName?: string,
 ): ts.Decorator {
+  const args: ts.Expression[] = typeName
+    ? [ts.factory.createStringLiteral(typeName)]
+    : []
   return ts.factory.createDecorator(
     ts.factory.createCallExpression(
       ts.factory.createPropertyAccessExpression(
@@ -338,7 +354,7 @@ function createClassDecorator(
         ts.factory.createIdentifier(decoratorName),
       ),
       undefined,
-      [],
+      args,
     ),
   )
 }
@@ -350,7 +366,7 @@ function transformClass(
   namespaceIdent: ts.Identifier,
   context: ts.TransformationContext,
   state: { modified: boolean },
-  autoDecorator: 'ArgsType' | 'InputType' | undefined,
+  autoDecorator: 'ArgsType' | 'InputType' | 'ObjectType' | undefined,
   checker?: ts.TypeChecker,
 ): ts.ClassDeclaration {
   const propertyVisitor = (member: ts.Node): ts.Node => {
@@ -391,7 +407,16 @@ function transformClass(
 
   if (autoDecorator) {
     state.modified = true
-    const classDecorator = createClassDecorator(autoDecorator, namespaceIdent)
+    const className = result.name?.text ?? ''
+    const typeName =
+      autoDecorator === 'ObjectType' && className.endsWith('Model')
+        ? className.slice(0, -5)
+        : undefined
+    const classDecorator = createClassDecorator(
+      autoDecorator,
+      namespaceIdent,
+      typeName,
+    )
     result = ts.factory.updateClassDeclaration(
       result,
       [classDecorator, ...(result.modifiers ?? [])],
@@ -441,6 +466,7 @@ function makeTransformer(
     : DEFAULT_SCALARS
   const autoArgsType = options?.autoArgsType ?? true
   const autoInputType = options?.autoInputType ?? true
+  const autoObjectType = options?.autoObjectType ?? true
   const checker = program?.getTypeChecker()
 
   return (context) => (sourceFile) => {
@@ -455,8 +481,9 @@ function makeTransformer(
     )
 
     const mightAutoDecorate =
-      (autoArgsType || autoInputType) &&
-      (fileName.endsWith('.args.ts') || fileName.endsWith('.input.ts'))
+      ((autoArgsType || autoInputType) &&
+        (fileName.endsWith('.args.ts') || fileName.endsWith('.input.ts'))) ||
+      (autoObjectType && fileName.endsWith('.model.ts'))
 
     if (
       flavoredIdNames.size === 0 &&
@@ -475,6 +502,7 @@ function makeTransformer(
           fileName,
           autoArgsType,
           autoInputType,
+          autoObjectType,
         )
         if (isGraphQLClass(node) || autoDecorator !== undefined) {
           return transformClass(
