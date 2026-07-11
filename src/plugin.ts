@@ -55,6 +55,15 @@ const GRAPHQL_CLASS_DECORATORS = new Set([
 
 const SKIP_PROPERTY_DECORATORS = new Set(['Field', 'HideField'])
 
+const RESOLVER_CLASS_DECORATOR = 'Resolver'
+// Resolver method decorators whose `() => Type` type argument this plugin can
+// synthesise from the method's return-type annotation.
+const RESOLVER_METHOD_DECORATORS = new Set([
+  'Query',
+  'Mutation',
+  'ResolveField',
+])
+
 function isConstObjectEnumDecl(decl: ts.VariableDeclaration): boolean {
   const initializer = decl.initializer
   if (!initializer) return false
@@ -110,6 +119,12 @@ function isGraphQLClass(node: ts.ClassDeclaration): boolean {
     const name = getDecoratorName(d)
     return name !== undefined && GRAPHQL_CLASS_DECORATORS.has(name)
   })
+}
+
+function isResolverClass(node: ts.ClassDeclaration): boolean {
+  return getDecorators(node).some(
+    (d) => getDecoratorName(d) === RESOLVER_CLASS_DECORATOR,
+  )
 }
 
 function hasSkipDecorator(node: ts.PropertyDeclaration): boolean {
@@ -883,6 +898,451 @@ function transformClass(
   return result
 }
 
+/**
+ * Unwraps a single `Promise<T>` layer, returning `T`. Returns the node unchanged
+ * when it is not a `Promise<...>` reference (e.g. a synchronous return type).
+ */
+function unwrapPromiseType(typeNode: ts.TypeNode): ts.TypeNode {
+  if (
+    ts.isTypeReferenceNode(typeNode) &&
+    ts.isIdentifier(typeNode.typeName) &&
+    typeNode.typeName.text === 'Promise' &&
+    typeNode.typeArguments?.length === 1
+  ) {
+    return typeNode.typeArguments[0]
+  }
+  return typeNode
+}
+
+/**
+ * Builds the `Type` expression that goes inside a resolver method's
+ * `() => Type` type argument, wrapping it in `[Type]` for list types.
+ *
+ * Unlike `@Field` on a property (where a class type must be routed through
+ * `_GRAPHQL_METADATA_FACTORY` to avoid an emitDecoratorMetadata `design:type`
+ * reference to a possibly-elided import), a method decorator's type argument is
+ * a lazy `() => Type` arrow, so a class can be referenced directly — via the
+ * shared require() namespace for imported classes, or a bare identifier for
+ * locally-defined ones.
+ */
+function buildMethodTypeExpr(
+  analysis: TypeAnalysis,
+  graphqlNs: ts.Identifier,
+  importedTypeEntries: Map<string, ImportedTypeEntry> | undefined,
+  state: TransformState,
+): ts.Expression {
+  let typeExpr: ts.Expression
+  if (analysis.metadataModulePath !== undefined) {
+    // Class type.
+    if (analysis.metadataModulePath === null) {
+      // Locally-defined class: bare identifier (the arrow is lazy, so no TDZ).
+      typeExpr = ts.factory.createIdentifier(analysis.gqlScalar)
+    } else {
+      const entry = importedTypeEntries?.get(analysis.gqlScalar)
+      if (entry) {
+        state.usedTypeNsIdents.add(entry.namespaceIdent)
+        typeExpr = ts.factory.createPropertyAccessExpression(
+          entry.namespaceIdent,
+          ts.factory.createIdentifier(analysis.gqlScalar),
+        )
+      } else {
+        // No shared namespace was collected — fall back to an inline require().
+        typeExpr = ts.factory.createPropertyAccessExpression(
+          ts.factory.createCallExpression(
+            ts.factory.createIdentifier('require'),
+            undefined,
+            [ts.factory.createStringLiteral(analysis.metadataModulePath)],
+          ),
+          ts.factory.createIdentifier(analysis.gqlScalar),
+        )
+      }
+    }
+  } else if (analysis.importedNsIdent) {
+    // Imported enum: reference via require() namespace to dodge import elision.
+    state.usedTypeNsIdents.add(analysis.importedNsIdent)
+    typeExpr = ts.factory.createPropertyAccessExpression(
+      analysis.importedNsIdent,
+      ts.factory.createIdentifier(analysis.gqlScalar),
+    )
+  } else if (analysis.useGlobalIdent) {
+    // Global constructor (String, Boolean, Date) or locally-defined enum.
+    typeExpr = ts.factory.createIdentifier(analysis.gqlScalar)
+  } else {
+    // GraphQL scalar exported from @nestjs/graphql (ID, Float, Int).
+    typeExpr = ts.factory.createPropertyAccessExpression(
+      graphqlNs,
+      ts.factory.createIdentifier(analysis.gqlScalar),
+    )
+  }
+
+  return analysis.isArray
+    ? ts.factory.createArrayLiteralExpression([typeExpr], false)
+    : typeExpr
+}
+
+/**
+ * Returns a copy of `call` (a resolver method decorator like `@Query()`) with a
+ * synthesised `() => Type` argument injected, preserving any leading
+ * string-literal field-name argument (`@ResolveField('name', ...)`) and adding
+ * `{ nullable: true }` when the return type is nullable.
+ */
+function injectMethodTypeArrow(
+  call: ts.CallExpression,
+  analysis: TypeAnalysis,
+  graphqlNs: ts.Identifier,
+  importedTypeEntries: Map<string, ImportedTypeEntry> | undefined,
+  state: TransformState,
+): ts.Decorator {
+  const leadingName =
+    call.arguments.length > 0 && ts.isStringLiteral(call.arguments[0])
+      ? [call.arguments[0]]
+      : []
+
+  const typeRef = buildMethodTypeExpr(
+    analysis,
+    graphqlNs,
+    importedTypeEntries,
+    state,
+  )
+  const arrow = ts.factory.createArrowFunction(
+    undefined,
+    undefined,
+    [],
+    undefined,
+    ts.factory.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+    typeRef,
+  )
+
+  const args: ts.Expression[] = [...leadingName, arrow]
+  if (analysis.isNullable) {
+    args.push(
+      ts.factory.createObjectLiteralExpression(
+        [
+          ts.factory.createPropertyAssignment(
+            'nullable',
+            ts.factory.createTrue(),
+          ),
+        ],
+        false,
+      ),
+    )
+  }
+
+  return ts.factory.createDecorator(
+    ts.factory.createCallExpression(call.expression, call.typeArguments, args),
+  )
+}
+
+/**
+ * Returns an `@Args()` decorator (referencing @nestjs/graphql via the shared
+ * require namespace) when `param` is undecorated and typed as a class whose name
+ * ends in `Args`, otherwise `undefined`. The parameter's type annotation is left
+ * in place, so NestJS reads the concrete type from `design:paramtypes`.
+ */
+function buildArgsDecorator(
+  param: ts.ParameterDeclaration,
+  graphqlNs: ts.Identifier,
+): ts.Decorator | undefined {
+  if (
+    !param.type ||
+    !ts.isTypeReferenceNode(param.type) ||
+    !ts.isIdentifier(param.type.typeName) ||
+    !param.type.typeName.text.endsWith('Args')
+  ) {
+    return undefined
+  }
+  return ts.factory.createDecorator(
+    ts.factory.createCallExpression(
+      ts.factory.createPropertyAccessExpression(
+        graphqlNs,
+        ts.factory.createIdentifier('Args'),
+      ),
+      undefined,
+      [],
+    ),
+  )
+}
+
+/**
+ * Builds a fresh `@ResolveField` decorator referencing the decorator via the
+ * @nestjs/graphql require namespace, with a synthesised `() => Type` argument
+ * (and `{ nullable: true }` when the return type is nullable). Used when the
+ * ResolveField decorator itself is inferred from a parent-typed parameter.
+ */
+function buildOperationDecorator(
+  decoratorName: string,
+  analysis: TypeAnalysis,
+  graphqlNs: ts.Identifier,
+  importedTypeEntries: Map<string, ImportedTypeEntry> | undefined,
+  state: TransformState,
+): ts.Decorator {
+  const typeRef = buildMethodTypeExpr(
+    analysis,
+    graphqlNs,
+    importedTypeEntries,
+    state,
+  )
+  const arrow = ts.factory.createArrowFunction(
+    undefined,
+    undefined,
+    [],
+    undefined,
+    ts.factory.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+    typeRef,
+  )
+  const args: ts.Expression[] = [arrow]
+  if (analysis.isNullable) {
+    args.push(
+      ts.factory.createObjectLiteralExpression(
+        [
+          ts.factory.createPropertyAssignment(
+            'nullable',
+            ts.factory.createTrue(),
+          ),
+        ],
+        false,
+      ),
+    )
+  }
+  return ts.factory.createDecorator(
+    ts.factory.createCallExpression(
+      ts.factory.createPropertyAccessExpression(
+        graphqlNs,
+        ts.factory.createIdentifier(decoratorName),
+      ),
+      undefined,
+      args,
+    ),
+  )
+}
+
+/**
+ * Builds a `@Parent()` decorator referencing @nestjs/graphql via the shared
+ * require namespace.
+ */
+function buildParentDecorator(graphqlNs: ts.Identifier): ts.Decorator {
+  return ts.factory.createDecorator(
+    ts.factory.createCallExpression(
+      ts.factory.createPropertyAccessExpression(
+        graphqlNs,
+        ts.factory.createIdentifier('Parent'),
+      ),
+      undefined,
+      [],
+    ),
+  )
+}
+
+/**
+ * Extracts the parent model name from a class's `@Resolver(() => Model)`
+ * decorator, or `undefined` for root resolvers / non-arrow forms.
+ */
+function getResolverParentTypeName(
+  node: ts.ClassDeclaration,
+): string | undefined {
+  const resolverDecorator = getDecorators(node).find(
+    (d) => getDecoratorName(d) === RESOLVER_CLASS_DECORATOR,
+  )
+  if (
+    !resolverDecorator ||
+    !ts.isCallExpression(resolverDecorator.expression)
+  ) {
+    return undefined
+  }
+  const firstArg = resolverDecorator.expression.arguments[0]
+  if (!firstArg || !ts.isArrowFunction(firstArg)) return undefined
+  return ts.isIdentifier(firstArg.body) ? firstArg.body.text : undefined
+}
+
+/**
+ * True when `param`'s type annotation is a direct reference to `typeName`
+ * (e.g. `parent: FooModel` matching a `@Resolver(() => FooModel)`).
+ */
+function paramTypeNameMatches(
+  param: ts.ParameterDeclaration,
+  typeName: string,
+): boolean {
+  return (
+    param.type !== undefined &&
+    ts.isTypeReferenceNode(param.type) &&
+    ts.isIdentifier(param.type.typeName) &&
+    param.type.typeName.text === typeName
+  )
+}
+
+/**
+ * Visits an `@Resolver`-decorated class and, for each resolver method:
+ * (a) synthesises the operation decorator's `() => Type` argument from the
+ * `Promise<...>` return type when omitted; (b) infers `@ResolveField` for an
+ * undecorated method whose single parameter is typed as the resolver's parent
+ * model; and (c) injects `@Parent()` on that parent parameter and `@Args()` on
+ * parameters typed as an `*Args` class. Query/Mutation stay explicit (the
+ * hybrid): a decorated method keeps its parameter-type imports alive, so
+ * `design:paramtypes` never dangles under emitDecoratorMetadata. Explicit type
+ * arguments and decorators always win; private/protected/static methods and
+ * synchronous (non-Promise) returns are left untouched.
+ */
+function transformResolverClass(
+  node: ts.ClassDeclaration,
+  flavoredIdNames: Set<string>,
+  sharedScalars: Map<string, string>,
+  graphqlNs: ts.Identifier,
+  context: ts.TransformationContext,
+  state: TransformState,
+  checker?: ts.TypeChecker,
+  importedTypeEntries?: Map<string, ImportedTypeEntry>,
+  exportedClassNames?: Set<string>,
+): ts.ClassDeclaration {
+  const parentTypeName = getResolverParentTypeName(node)
+
+  const methodVisitor = (member: ts.Node): ts.Node => {
+    if (!ts.isMethodDeclaration(member)) return member
+
+    const existing = (ts.getDecorators(member) ?? []).find((d) => {
+      const name = getDecoratorName(d)
+      return name !== undefined && RESOLVER_METHOD_DECORATORS.has(name)
+    })
+
+    // Non-exposable methods (private/protected/static) are never operations.
+    const isHidden = (member.modifiers ?? []).some(
+      (m) =>
+        m.kind === ts.SyntaxKind.PrivateKeyword ||
+        m.kind === ts.SyntaxKind.ProtectedKeyword ||
+        m.kind === ts.SyntaxKind.StaticKeyword,
+    )
+
+    // Infer `@ResolveField` for an undecorated method whose SINGLE parameter is
+    // typed as the resolver's parent model. Restricting to one parameter keeps
+    // inference elision-safe: the parent type stays alive via `@Resolver(() =>
+    // Model)`, whereas an injected `@Args` on an undecorated method would leave
+    // `design:paramtypes` referencing an elided import. Multi-parameter resolve
+    // fields (and all queries/mutations) keep an explicit decorator.
+    const inferResolveField =
+      existing === undefined &&
+      !isHidden &&
+      parentTypeName !== undefined &&
+      member.parameters.length === 1 &&
+      paramTypeNameMatches(member.parameters[0], parentTypeName)
+
+    if (!existing && !inferResolveField) return member
+
+    const isResolveField =
+      inferResolveField ||
+      (existing !== undefined && getDecoratorName(existing) === 'ResolveField')
+
+    // Operation decorator: fill the `() => Type` argument on an existing
+    // decorator that omits it, or synthesise the whole decorator when inferred.
+    // Explicit type arguments always win; only Promise-returning methods are
+    // handled — a synchronous class return type would surface in
+    // emitDecoratorMetadata's `design:returntype`.
+    let synthesizedDecorator: ts.Decorator | undefined
+    let replacementDecorator: ts.Decorator | undefined
+
+    const needsReturnArrow =
+      inferResolveField ||
+      (existing !== undefined &&
+        ts.isCallExpression(existing.expression) &&
+        !existing.expression.arguments.some((a) => ts.isArrowFunction(a)))
+
+    if (needsReturnArrow && member.type) {
+      const inner = unwrapPromiseType(member.type)
+      if (inner !== member.type) {
+        const analysis = analyzeType(
+          inner,
+          false,
+          flavoredIdNames,
+          sharedScalars,
+          checker,
+          importedTypeEntries,
+          exportedClassNames,
+        )
+        if (analysis && inferResolveField) {
+          synthesizedDecorator = buildOperationDecorator(
+            'ResolveField',
+            analysis,
+            graphqlNs,
+            importedTypeEntries,
+            state,
+          )
+        } else if (
+          analysis &&
+          existing !== undefined &&
+          ts.isCallExpression(existing.expression)
+        ) {
+          replacementDecorator = injectMethodTypeArrow(
+            existing.expression,
+            analysis,
+            graphqlNs,
+            importedTypeEntries,
+            state,
+          )
+        }
+      }
+    }
+
+    // An inferred ResolveField could not be synthesised (missing/synchronous
+    // return type) — leave the otherwise-undecorated method untouched.
+    if (inferResolveField && !synthesizedDecorator) {
+      return member
+    }
+
+    // Parameters: `@Parent()` on the parent-typed first param of a ResolveField,
+    // `@Args()` on parameters typed as an `*Args` class.
+    let paramsChanged = false
+    const newParameters = member.parameters.map((param, index) => {
+      if ((ts.getDecorators(param) ?? []).length > 0) return param
+      const paramDecorator =
+        isResolveField &&
+        index === 0 &&
+        parentTypeName !== undefined &&
+        paramTypeNameMatches(param, parentTypeName)
+          ? buildParentDecorator(graphqlNs)
+          : buildArgsDecorator(param, graphqlNs)
+      if (!paramDecorator) return param
+      paramsChanged = true
+      return ts.factory.updateParameterDeclaration(
+        param,
+        [paramDecorator, ...(param.modifiers ?? [])],
+        param.dotDotDotToken,
+        param.name,
+        param.questionToken,
+        param.type,
+        param.initializer,
+      )
+    })
+
+    if (!synthesizedDecorator && !replacementDecorator && !paramsChanged) {
+      return member
+    }
+    state.modified = true
+
+    const existingModifiers = member.modifiers ?? []
+    const newModifiers: ts.ModifierLike[] = synthesizedDecorator
+      ? [synthesizedDecorator, ...existingModifiers]
+      : existingModifiers.map((m) =>
+          replacementDecorator && ts.isDecorator(m) && m === existing
+            ? replacementDecorator
+            : m,
+        )
+
+    return ts.factory.updateMethodDeclaration(
+      member,
+      newModifiers,
+      member.asteriskToken,
+      member.name,
+      member.questionToken,
+      member.typeParameters,
+      paramsChanged
+        ? ts.factory.createNodeArray(newParameters)
+        : member.parameters,
+      member.type,
+      member.body,
+    )
+  }
+
+  return ts.visitEachChild(node, methodVisitor, context) as ts.ClassDeclaration
+}
+
 function buildRequireStatement(
   namespaceIdent: ts.Identifier,
   modulePath: string,
@@ -939,10 +1399,13 @@ function makeTransformer(
         (fileName.endsWith('.args.ts') || fileName.endsWith('.input.ts'))) ||
       (autoObjectType && fileName.endsWith('.model.ts'))
 
+    const mightHaveResolver = fileName.endsWith('.resolver.ts')
+
     if (
       flavoredIdNames.size === 0 &&
       sharedScalars.size === 0 &&
-      !mightAutoDecorate
+      !mightAutoDecorate &&
+      !mightHaveResolver
     )
       return sourceFile
 
@@ -962,6 +1425,19 @@ function makeTransformer(
 
     const visit = (node: ts.Node): ts.Node => {
       if (ts.isClassDeclaration(node)) {
+        if (isResolverClass(node)) {
+          return transformResolverClass(
+            node,
+            flavoredIdNames,
+            sharedScalars,
+            namespaceIdent,
+            context,
+            state,
+            checker,
+            importedTypeEntries,
+            exportedClassNames,
+          )
+        }
         const autoDecorator = getAutoClassDecorator(
           node,
           fileName,

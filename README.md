@@ -2,7 +2,7 @@
 
 Two complementary tools that eliminate the GraphQL schema boilerplate you would otherwise write by hand in a NestJS project:
 
-1. **TypeScript compiler plugin** — auto-injects `@Field()` decorators on class properties typed as [flavoured Prisma IDs](https://github.com/Hatkom-io/prisma-generator-flavoured-ids), enums, or configured scalar aliases. Also auto-injects `@ArgsType()` / `@InputType()` on undecorated classes in `*.args.ts` / `*.input.ts` files.
+1. **TypeScript compiler plugin** — auto-injects `@Field()` on class properties typed as [flavoured Prisma IDs](https://github.com/Hatkom-io/prisma-generator-flavoured-ids), enums, or configured scalar aliases; auto-injects `@ArgsType()` / `@InputType()` / `@ObjectType()` on undecorated classes in `*.args.ts` / `*.input.ts` / `*.model.ts` files; and completes resolver decorators in `*.resolver.ts` files (filling `@Query`/`@Mutation`/`@ResolveField` type arguments, injecting `@Args` / `@Parent`, and inferring `@ResolveField` from the parent-typed parameter).
 2. **`nestjs-generate-enums` CLI** — scans your source tree for enums referenced in GraphQL decorators **and** in class properties inside `*.args.ts` / `*.input.ts` files, then generates a single file of `registerEnumType(...)` calls you import once from your app module.
 
 ## Installation
@@ -31,6 +31,14 @@ It also auto-injects class-level decorators so none need to be written by hand:
 - `@ArgsType()` on classes ending in `Args` inside `*.args.ts` files
 - `@InputType()` on classes ending in `Input` inside `*.input.ts` files
 - `@ObjectType()` on classes ending in `Model` inside `*.model.ts` files
+
+Inside `@Resolver()`-decorated classes in `*.resolver.ts` files, it also completes resolver method and parameter decorators:
+
+- **Return-type argument** — for a method decorated with `@Query`, `@Mutation`, or `@ResolveField` that omits the `() => Type` argument, synthesises it from the method's `Promise<...>` return type (handling nullable, arrays, flavoured IDs, scalars, enums, and object types).
+- **`@Args()`** — injected on undecorated parameters typed as a class whose name ends in `Args`.
+- **`@ResolveField()` + `@Parent()`** — both inferred for an undecorated method whose single parameter is typed as the resolver's parent model (from `@Resolver(() => Model)`). Multi-parameter resolve fields keep an explicit `@ResolveField`.
+
+`@Query` / `@Mutation` are always written by hand — they encode the read-vs-write distinction that no type carries, and keeping the method decorator also prevents TypeScript from eliding parameter-type imports (so `emitDecoratorMetadata` stays sound). The plugin only fills in their `() => Type` argument.
 
 ### Configuration
 
@@ -86,6 +94,7 @@ With options:
 - For `*.args.ts` and `*.input.ts` files, auto-injects `@ArgsType()` / `@InputType()` on matching class names. For `*.model.ts` files, auto-injects `@ObjectType()` on classes ending in `Model`. Classes already carrying any GraphQL class decorator are left untouched.
 - Inside eligible classes, injects `@Field()` for flavoured ID types, enums, and configured scalar aliases. Properties already carrying `@Field` or `@HideField` are skipped.
 - Handles `T[]`, `Array<T>`, `T | null`, and optional (`?:`) for array-ness and nullability.
+- In `*.resolver.ts` files, unwraps a single `Promise<...>` layer to read a resolver method's GraphQL type. Explicit type arguments and hand-written decorators always win; private, protected, static, and synchronous (non-`Promise`) methods are left untouched.
 
 ### Before / after
 
@@ -107,6 +116,29 @@ export class FindInvoicesArgs {
   fundId: FundId
   status: InvoiceStatus
   page?: number
+}
+```
+
+Resolvers shrink the same way — arrows and parameter decorators are filled in, and single-parameter resolve fields drop `@ResolveField` / `@Parent` entirely:
+
+```typescript
+// Before
+@Resolver(() => Fund)
+export class FundResolver {
+  @Query(() => [Fund])
+  funds(@Args() args: FindFundsArgs): Promise<Fund[]> { /* ... */ }
+
+  @ResolveField(() => [Investor])
+  Investors(@Parent() fund: Fund): Promise<Investor[]> { /* ... */ }
+}
+
+// After
+@Resolver(() => Fund)
+export class FundResolver {
+  @Query()
+  funds(args: FindFundsArgs): Promise<Fund[]> { /* ... */ }
+
+  Investors(fund: Fund): Promise<Investor[]> { /* ... */ }
 }
 ```
 
