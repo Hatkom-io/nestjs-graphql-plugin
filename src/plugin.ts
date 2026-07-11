@@ -44,6 +44,14 @@ export type PluginOptions = {
    * are left untouched. Defaults to `true`.
    */
   autoObjectType?: boolean
+  /**
+   * Map of parameter type name → custom parameter decorator to inject on
+   * undecorated resolver parameters of that type. Intended for context
+   * decorators like `@GetUser()`/`@GetAbility()` that read from the request
+   * rather than the schema. Example:
+   * `{ "User": { "name": "GetUser", "module": "src/auth/auth.guard" } }`.
+   */
+  paramDecorators?: Record<string, { name: string; module: string }>
 }
 
 const GRAPHQL_CLASS_DECORATORS = new Set([
@@ -675,6 +683,8 @@ type TransformState = {
   // Paths of imported class modules that need a top-level side-effect require()
   // so their @InputType()/@ObjectType() decorators run before NestJS schema compile().
   sideEffectRequirePaths: Set<string>
+  // Module path → require namespace for injected custom parameter decorators.
+  extraRequires: Map<string, ts.Identifier>
 }
 
 type MetadataFactoryEntry = {
@@ -1034,28 +1044,123 @@ function injectMethodTypeArrow(
 }
 
 /**
- * Returns an `@Args()` decorator (referencing @nestjs/graphql via the shared
- * require namespace) when `param` is undecorated and typed as a class whose name
- * ends in `Args`, otherwise `undefined`. The parameter's type annotation is left
- * in place, so NestJS reads the concrete type from `design:paramtypes`.
+ * Returns an `@Args` decorator for an undecorated parameter:
+ *   - a class whose name ends in `Args` → whole-args `@Args()` (NestJS reads the
+ *     concrete type from `design:paramtypes`);
+ *   - otherwise a single named argument `@Args('<paramName>', { type: () => X })`
+ *     where the GraphQL name defaults to the parameter name and the type is
+ *     inferred from the parameter's type (ID/scalar/enum/input). A parameter
+ *     whose GraphQL name must differ keeps an explicit `@Args('other', ...)`.
+ * Returns `undefined` when no argument type can be inferred.
  */
 function buildArgsDecorator(
   param: ts.ParameterDeclaration,
   graphqlNs: ts.Identifier,
+  flavoredIdNames: Set<string>,
+  sharedScalars: Map<string, string>,
+  state: TransformState,
+  checker?: ts.TypeChecker,
+  importedTypeEntries?: Map<string, ImportedTypeEntry>,
+  exportedClassNames?: Set<string>,
+): ts.Decorator | undefined {
+  if (!param.type) return undefined
+
+  const argsCall = (args: ts.Expression[]): ts.Decorator =>
+    ts.factory.createDecorator(
+      ts.factory.createCallExpression(
+        ts.factory.createPropertyAccessExpression(
+          graphqlNs,
+          ts.factory.createIdentifier('Args'),
+        ),
+        undefined,
+        args,
+      ),
+    )
+
+  // Whole-args object: a class whose name ends in `Args`.
+  if (
+    ts.isTypeReferenceNode(param.type) &&
+    ts.isIdentifier(param.type.typeName) &&
+    param.type.typeName.text.endsWith('Args')
+  ) {
+    return argsCall([])
+  }
+
+  // Named single argument. Requires a plain identifier parameter name — the
+  // GraphQL arg name defaults to it.
+  if (!ts.isIdentifier(param.name)) return undefined
+  const analysis = analyzeType(
+    param.type,
+    param.questionToken !== undefined,
+    flavoredIdNames,
+    sharedScalars,
+    checker,
+    importedTypeEntries,
+    exportedClassNames,
+  )
+  if (!analysis) return undefined
+
+  const typeRef = buildMethodTypeExpr(
+    analysis,
+    graphqlNs,
+    importedTypeEntries,
+    state,
+  )
+  const optionProps: ts.PropertyAssignment[] = [
+    ts.factory.createPropertyAssignment(
+      'type',
+      ts.factory.createArrowFunction(
+        undefined,
+        undefined,
+        [],
+        undefined,
+        ts.factory.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+        typeRef,
+      ),
+    ),
+  ]
+  if (analysis.isNullable) {
+    optionProps.push(
+      ts.factory.createPropertyAssignment('nullable', ts.factory.createTrue()),
+    )
+  }
+  return argsCall([
+    ts.factory.createStringLiteral(param.name.text),
+    ts.factory.createObjectLiteralExpression(optionProps, false),
+  ])
+}
+
+/**
+ * Returns a custom parameter decorator (e.g. `@GetUser()`) for an undecorated
+ * parameter whose type name is listed in `paramDecorators`, referencing the
+ * decorator via a require namespace for its module. Returns `undefined` when the
+ * type is not mapped. These are context decorators, so the parameter's reflected
+ * type is irrelevant — elision of the type import is harmless.
+ */
+function buildCustomParamDecorator(
+  param: ts.ParameterDeclaration,
+  paramDecorators: Map<string, { name: string; module: string }>,
+  state: TransformState,
 ): ts.Decorator | undefined {
   if (
     !param.type ||
     !ts.isTypeReferenceNode(param.type) ||
-    !ts.isIdentifier(param.type.typeName) ||
-    !param.type.typeName.text.endsWith('Args')
+    !ts.isIdentifier(param.type.typeName)
   ) {
     return undefined
+  }
+  const entry = paramDecorators.get(param.type.typeName.text)
+  if (!entry) return undefined
+  let ns = state.extraRequires.get(entry.module)
+  if (!ns) {
+    ns = ts.factory.createUniqueName('__pid_param')
+    state.extraRequires.set(entry.module, ns)
   }
   return ts.factory.createDecorator(
     ts.factory.createCallExpression(
       ts.factory.createPropertyAccessExpression(
-        graphqlNs,
-        ts.factory.createIdentifier('Args'),
+        ns,
+        ts.factory.createIdentifier(entry.name),
       ),
       undefined,
       [],
@@ -1189,6 +1294,7 @@ function transformResolverClass(
   graphqlNs: ts.Identifier,
   context: ts.TransformationContext,
   state: TransformState,
+  paramDecorators: Map<string, { name: string; module: string }>,
   checker?: ts.TypeChecker,
   importedTypeEntries?: Map<string, ImportedTypeEntry>,
   exportedClassNames?: Set<string>,
@@ -1297,7 +1403,17 @@ function transformResolverClass(
         parentTypeName !== undefined &&
         paramTypeNameMatches(param, parentTypeName)
           ? buildParentDecorator(graphqlNs)
-          : buildArgsDecorator(param, graphqlNs)
+          : (buildCustomParamDecorator(param, paramDecorators, state) ??
+            buildArgsDecorator(
+              param,
+              graphqlNs,
+              flavoredIdNames,
+              sharedScalars,
+              state,
+              checker,
+              importedTypeEntries,
+              exportedClassNames,
+            ))
       if (!paramDecorator) return param
       paramsChanged = true
       return ts.factory.updateParameterDeclaration(
@@ -1381,6 +1497,9 @@ function makeTransformer(
   const autoArgsType = options?.autoArgsType ?? true
   const autoInputType = options?.autoInputType ?? true
   const autoObjectType = options?.autoObjectType ?? true
+  const paramDecorators = options?.paramDecorators
+    ? new Map(Object.entries(options.paramDecorators))
+    : new Map<string, { name: string; module: string }>()
   const checker = program?.getTypeChecker()
 
   return (context) => (sourceFile) => {
@@ -1421,6 +1540,7 @@ function makeTransformer(
       modified: false,
       usedTypeNsIdents: new Set(),
       sideEffectRequirePaths: new Set(),
+      extraRequires: new Map(),
     }
 
     const visit = (node: ts.Node): ts.Node => {
@@ -1433,6 +1553,7 @@ function makeTransformer(
             namespaceIdent,
             context,
             state,
+            paramDecorators,
             checker,
             importedTypeEntries,
             exportedClassNames,
@@ -1510,6 +1631,12 @@ function makeTransformer(
         )
         insertAt++
       }
+    }
+
+    // Require statements for injected custom parameter decorator modules.
+    for (const [module, ns] of state.extraRequires) {
+      statements.splice(insertAt, 0, buildRequireStatement(ns, module))
+      insertAt++
     }
 
     statements.splice(
