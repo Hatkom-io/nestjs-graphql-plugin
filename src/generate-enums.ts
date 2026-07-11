@@ -257,6 +257,60 @@ for (const file of project.getSourceFiles()) {
   }
 }
 
+// Also scan resolver method return types and parameter types in *.resolver.ts.
+// De-boilerplated resolvers omit the `@ResolveField(() => Enum)` arrow, so an
+// enum used only in a bare return type (or parameter) would otherwise be missed.
+const RESOLVER_RE = /\.resolver\.ts$/
+
+const unwrapPromise = (node: Node): Node => {
+  if (
+    Node.isTypeReference(node) &&
+    node.getTypeName().getText() === 'Promise'
+  ) {
+    const arg = node.getTypeArguments()[0]
+    if (arg) return arg
+  }
+  return node
+}
+
+const registerEnumFromTypeNode = (
+  typeNode: Node | undefined,
+  file: SourceFile,
+) => {
+  if (!typeNode) return
+  const identifier = extractBaseTypeIdentifier(unwrapPromise(typeNode))
+  if (!identifier || identifier.getText() === 'ID') return
+  const resolved = resolveEnum(identifier)
+  if (!resolved) return
+  const sourceModule = resolveSourceModule(
+    identifier.getText(),
+    resolved.sourceFilePath,
+    file,
+  )
+  if (!sourceModule) return
+  const key = `${sourceModule}::${resolved.name}`
+  registrations.set(key, {
+    sourceModule,
+    identifier: resolved.name,
+    graphqlName: nameOverrides.get(key) ?? resolved.name,
+  })
+}
+
+for (const file of project.getSourceFiles()) {
+  const filePath = file.getFilePath()
+  if (!filePath.startsWith(srcRoot) || filePath === outputFile) continue
+  if (!RESOLVER_RE.test(filePath)) continue
+
+  for (const cls of file.getClasses()) {
+    for (const method of cls.getMethods()) {
+      registerEnumFromTypeNode(method.getReturnTypeNode(), file)
+      for (const param of method.getParameters()) {
+        registerEnumFromTypeNode(param.getTypeNode(), file)
+      }
+    }
+  }
+}
+
 const sorted = [...registrations.values()].sort(
   (a, b) =>
     a.sourceModule.localeCompare(b.sourceModule) ||
