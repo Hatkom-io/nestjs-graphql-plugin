@@ -1483,6 +1483,35 @@ function buildRequireStatement(
   )
 }
 
+/**
+ * Resolves a module specifier (e.g. a `paramDecorators` config value like
+ * `src/auth/auth.guard`) against the importing file using the program's
+ * compiler options, then rewrites it to a path relative to that file. This
+ * mirrors the relativization applied to imported type requires so injected
+ * `require(...)` calls resolve at runtime. Falls back to the original
+ * specifier when it can't be resolved (e.g. bare package names).
+ */
+function relativizeModuleSpecifier(
+  spec: string,
+  importingFile: string,
+  program: ts.Program | undefined,
+): string {
+  if (!program) return spec
+  const resolved = ts.resolveModuleName(
+    spec,
+    importingFile,
+    program.getCompilerOptions(),
+    ts.sys,
+  )
+  const target = resolved.resolvedModule?.resolvedFileName
+  if (!target) return spec
+  const rel = path.relative(
+    path.dirname(importingFile),
+    target.replace(/\.tsx?$/, ''),
+  )
+  return rel.startsWith('.') ? rel : './' + rel
+}
+
 function makeTransformer(
   options: PluginOptions | undefined,
   program: ts.Program | undefined,
@@ -1634,8 +1663,17 @@ function makeTransformer(
     }
 
     // Require statements for injected custom parameter decorator modules.
+    // The `module` is the raw specifier from `paramDecorators` config (e.g.
+    // `src/auth/auth.guard`). Relativize it to the emitting file the same way
+    // imported type requires are, so the emitted `require(...)` resolves at
+    // runtime instead of leaving a bare, unresolvable specifier.
     for (const [module, ns] of state.extraRequires) {
-      statements.splice(insertAt, 0, buildRequireStatement(ns, module))
+      const resolved = relativizeModuleSpecifier(
+        module,
+        sourceFile.fileName,
+        program,
+      )
+      statements.splice(insertAt, 0, buildRequireStatement(ns, resolved))
       insertAt++
     }
 
